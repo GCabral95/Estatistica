@@ -1,0 +1,115 @@
+import pandas as pd
+import numpy as np
+
+# ---- 1) Leitura -------------------------------------------------------------
+# df = pd.read_excel("sua_base.xlsx", sheet_name=0)   # ou:
+# df = pd.read_csv("sua_base.csv")
+
+# Exemplo: se já tiver df, normalize nomes de colunas
+rename_map = {
+    'demografia':'Demografia',
+    'valor_demografia':'Valor_demografia',
+    'afirmativa':'Afirmativa',
+    'favorabilidade':'Favorabilidade',
+    'total_respondentes':'Total_Respondentes',
+    'margem_erro':'Margem_Erro'
+}
+df = df.rename(columns={c: rename_map.get(c.lower(), c) for c in df.columns})
+
+# Garante tipos corretos
+num_cols = ['Favorabilidade','Total_Respondentes','Margem_Erro']
+for c in num_cols:
+    df[c] = pd.to_numeric(df[c], errors='coerce')
+
+# ---- 2) Funções auxiliares --------------------------------------------------
+def compute_total_row(g):
+    """
+    Recebe um grupo com as linhas de uma (Demografia, Afirmativa) e retorna
+    a linha 'Total' (se existir) ou cria uma calculada por ponderação.
+    """
+    # Tenta achar linha de total explicitamente
+    mask_total = (
+        g['Valor_demografia'].astype(str).str.lower().eq('total')
+        | g['Demografia'].astype(str).str.lower().eq('total')
+    )
+    if mask_total.any():
+        tot = g.loc[mask_total].iloc[0].copy()
+        return tot
+
+    # Caso não exista, calcula o total ponderado
+    N = g['Total_Respondentes'].sum()
+    # Favorabilidade em proporção
+    p = (g['Favorabilidade'] / 100.0)
+    p_total = np.average(p, weights=g['Total_Respondentes'])
+    # IC do total: se Margem_Erro não existir para o total, estima por binomial
+    # ME (95%) ~ 1.96 * sqrt(p*(1-p)/N) em proporção -> converte para p.p. no fim
+    me_total_prop = 1.96 * np.sqrt(p_total * (1 - p_total) / N) if N > 0 else np.nan
+
+    tot = pd.Series({
+        'Demografia': g['Demografia'].iloc[0],
+        'Valor_demografia': 'Total (calculado)',
+        'Afirmativa': g['Afirmativa'].iloc[0],
+        'Favorabilidade': p_total * 100.0,            # em %
+        'Total_Respondentes': N,
+        'Margem_Erro': me_total_prop * 100.0          # em p.p.
+    })
+    return tot
+
+def mark_significance(group):
+    """
+    Para um grupo (mesma Demografia & Afirmativa), compara cada valor_demografia
+    contra o Total da demografia (mesma afirmativa) usando ICs de 95% já fornecidos
+    (Favorabilidade ± Margem_Erro). Se não houver Total, cria um calculado.
+    """
+    total_row = compute_total_row(group)
+
+    # Constrói IC do total em proporção
+    tot_p = total_row['Favorabilidade'] / 100.0
+    tot_me = total_row['Margem_Erro'] / 100.0
+    tot_lo, tot_hi = tot_p - tot_me, tot_p + tot_me
+
+    out = group.copy()
+    # IC de cada subgrupo
+    p = out['Favorabilidade'] / 100.0
+    me = out['Margem_Erro'] / 100.0
+    lo = p - me
+    hi = p + me
+
+    # Regra de não sobreposição
+    sig = (hi < tot_lo) | (lo > tot_hi)
+
+    out['Benchmark_Valor'] = total_row['Valor_demografia']
+    out['Benchmark_Favorabilidade_%'] = total_row['Favorabilidade']
+    out['Benchmark_Margem_Erro_pp'] = total_row['Margem_Erro']
+
+    out['IC_Low_%'] = lo * 100.0
+    out['IC_High_%'] = hi * 100.0
+    out['IC_Tot_Low_%'] = tot_lo * 100.0
+    out['IC_Tot_High_%'] = tot_hi * 100.0
+
+    out['Diferenca_pp'] = out['Favorabilidade'] - total_row['Favorabilidade']
+    out['Significante'] = sig
+    out['Direcao'] = np.where(sig & (out['Diferenca_pp'] > 0), 'acima',
+                       np.where(sig & (out['Diferenca_pp'] < 0), 'abaixo', '—'))
+    return out
+
+# ---- 3) Aplicar por (Demografia, Afirmativa) --------------------------------
+result = (df
+          .groupby(['Demografia','Afirmativa'], group_keys=False)
+          .apply(mark_significance)
+          .reset_index(drop=True))
+
+# ---- 4) Filtrar apenas diferenças significantes (se quiser) -----------------
+significantes = result.loc[result['Significante']].copy()
+
+# ---- 5) Ordene/mostre as principais colunas --------------------------------
+cols_show = [
+    'Demografia','Valor_demografia','Afirmativa',
+    'Favorabilidade','Margem_Erro','Total_Respondentes',
+    'Benchmark_Valor','Benchmark_Favorabilidade_%','Benchmark_Margem_Erro_pp',
+    'IC_Low_%','IC_High_%','IC_Tot_Low_%','IC_Tot_High_%',
+    'Diferenca_pp','Direcao','Significante'
+]
+print(significantes[cols_show].sort_values(
+    ['Demografia','Afirmativa','Direcao','Diferenca_pp'], ascending=[True,True,True,False]
+))
